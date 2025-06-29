@@ -34,7 +34,7 @@ _SIGNED_CACHE = {"url": None, "expires": 0}          # NEW
 async def get_signed_url(agent_id, api_key):
     now = time.time()
     if _SIGNED_CACHE["url"] and now < _SIGNED_CACHE["expires"]:
-        return _SIGNED_CACHE["url"]                  # still valid
+        return _SIGNED_CACHE["url"]
     signed = await fetch_signed_url(agent_id, api_key)
     _SIGNED_CACHE.update({"url": signed, "expires": now + 14*60})
     return signed
@@ -45,58 +45,86 @@ class ElevenSession:
     def __init__(self, agent_id: str, api_key: str | None):
         self.agent_id = agent_id
         self.api_key = api_key
-        self.ws: websockets.WebSocketClientProtocol | None = None
-        self._out_started = False  # did we send Wyoming AudioStart back yet?
-        self._ready = asyncio.Event()
+        self.websocket: websockets.WebSocketClientProtocol | None = None
+        self.ready = asyncio.Event()
 
     async def connect(self):
         print(f"Connecting to ElevenLabs agent {self.agent_id}…")
         signed_ws = await get_signed_url(self.agent_id, self.api_key)
-        self._ws = await websockets.connect(signed_ws)   # no headers!
-        await self._ws.send(json.dumps({
+        self.websocket = await websockets.connect(signed_ws)   # no headers!
+        await self.websocket.send(json.dumps({
             "type": "conversation_initiation_client_data"
         }))
-        self._ready.set()
+        self.ready.set()
         _LOGGER.debug("Opened ElevenLabs session")
 
     async def send_pcm(self, chunk: AudioChunk):
         """Forward raw PCM from Wyoming to Eleven."""
         print(f"Sending audio chunk to ElevenLabs agent {self.agent_id}…")
-        await self._ready.wait()
-        await self.ws.send(json.dumps({
-            "user_audio_chunk": base64.b64encode(chunk.audio).decode()
-        }))
-        print(f"Sent {chunk.samples} samples to ElevenLabs agent {self.agent_id}")
+        await self.ready.wait()
+        pcm = chunk.audio                    # raw 16-bit little-endian
+        frame_len = 320                      # 20 ms @16 kHz * 2 bytes
+        for i in range(0, len(pcm), frame_len):
+            piece = pcm[i : i + frame_len]
+            await self.ws.send(json.dumps({
+                "user_audio_chunk": base64.b64encode(piece).decode()
+            }))
+            
+        print(f"Sent {len(pcm)} bytes of audio to ElevenLabs agent {self.agent_id}")
 
-    async def recv_events(self):
-        """Async generator of Wyoming audio events produced by agent TTS."""
-        print(f"Receiving events from ElevenLabs agent {self.agent_id}…")
-        if self.ws is None:
-            return
-        async for msg in self.ws:
-            data = json.loads(msg)
-            mtype = data.get("type")
-            # Ping ➜ Pong (Eleven keeps its own ping frames in JSON) :contentReference[oaicite:5]{index=5}
-            if mtype == "ping":
-                await self.ws.send(json.dumps({"type": "pong",
-                                               "event_id": data["ping_event"]["event_id"]}))
-            elif mtype == "audio":
-                pcm = base64.b64decode(data["audio_event"]["audio_base_64"])
-                # yield Wyoming audio events on the fly
-                if not self._out_started:
-                    self._out_started = True
-                    yield AudioStart(rate=16000, width=2, channels=1)
-                yield AudioChunk(rate=16000, width=2, channels=1, audio=pcm)
-            elif mtype == "agent_response":
-                # Close audio stream after final text; you may refine this.
-                if self._out_started:
-                    self._out_started = False
-                    yield AudioStop()
-            # ignore transcript, VAD, etc. for this PoC
+    async def receive_events(self):
+        """
+        Async generator producing Wyoming `AudioStart/Chunk/Stop`
+        (and optional `transcript` events) from ElevenLabs frames.
+        Reconnects transparently if the socket drops.
+        """
+        await self.ready.wait()
+        while True:
+            async for msg in self.websocket:
+                frame = json.loads(msg)
+                print(f"Received frame from ElevenLabs: {frame}")
+                ftype = frame.get("type")
+
+                # keep-alive
+                if ftype == "ping":
+                    await self.websocket.send(json.dumps({
+                        "type": "pong",
+                        "event_id": frame["ping_event"]["event_id"]
+                    }))
+                    continue
+
+                # TTS audio back from ElevenLabs
+                if ftype == "audio":
+                    pcm = base64.b64decode(
+                        frame["audio_event"]["audio_base_64"])
+                    if not self._sent_start:
+                        self._sent_start = True
+                        yield AudioStart(rate=16000,
+                                            width=2, channels=1).event()
+                        
+                    yield AudioChunk(rate=16000, width=2,
+                                        channels=1, audio=pcm).event()
+                    continue
+
+                # Conversation turn finished
+                if ftype == "agent_response" and self._sent_start:
+                    self._sent_start = False
+                    yield AudioStop().event()
+                    continue
+
+                # (Optional) user transcript event
+                if ftype == "user_transcript":
+                    text = frame["user_transcription_event"] \
+                                ["user_transcript"]
+                    yield Event("transcript", data={
+                        "text": text,
+                        "is_final": True,
+                        "confidence": 0.9
+                    })
 
     async def close(self):
-        if self.ws:
-            await self.ws.close()
+        if self.websocket:
+            await self.websocket.close()
 
 # -----------------------------------------------------------------------------
 class BridgeHandler(AsyncEventHandler):
@@ -185,7 +213,7 @@ class BridgeHandler(AsyncEventHandler):
     async def _pump_from_eleven(self):
         assert self._session is not None
         try:
-            async for wy_event in self._session.recv_events():
+            async for wy_event in self._session.receive_events():
                 await self.write_event(wy_event.event() if hasattr(wy_event, "event") else wy_event)
         except Exception as err:
             _LOGGER.exception("Error reading from ElevenLabs: %s", err)

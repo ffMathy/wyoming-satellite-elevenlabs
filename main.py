@@ -5,6 +5,7 @@ Tested on Windows 10/11 with Python 3.11, wyoming ≥0.8.0, websockets ≥12.
 """
 
 import asyncio, os, json, base64, argparse, logging
+import httpx, time, functools, os
 import websockets
 from wyoming.audio import AudioFormat, AudioStart, AudioChunk, AudioStop
 from wyoming.event import Event
@@ -19,6 +20,25 @@ _LOGGER = logging.getLogger("wyoming-elevenlabs")
 
 ELEVEN_WSS = "wss://api.elevenlabs.io/v1/convai/conversation"
 
+async def fetch_signed_url(agent_id: str, api_key: str) -> str:
+    url = "https://api.elevenlabs.io/v1/convai/conversation/get-signed-url"
+    headers = {"xi-api-key": api_key}
+    params  = {"agent_id": agent_id}
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(url, headers=headers, params=params)
+    r.raise_for_status()
+    return r.json()["signed_url"]
+
+_SIGNED_CACHE = {"url": None, "expires": 0}          # NEW
+
+async def get_signed_url(agent_id, api_key):
+    now = time.time()
+    if _SIGNED_CACHE["url"] and now < _SIGNED_CACHE["expires"]:
+        return _SIGNED_CACHE["url"]                  # still valid
+    signed = await fetch_signed_url(agent_id, api_key)
+    _SIGNED_CACHE.update({"url": signed, "expires": now + 14*60})
+    return signed
+
 # -----------------------------------------------------------------------------
 class ElevenSession:
     """Maintains one agent WebSocket per Wyoming client."""
@@ -27,24 +47,26 @@ class ElevenSession:
         self.api_key = api_key
         self.ws: websockets.WebSocketClientProtocol | None = None
         self._out_started = False  # did we send Wyoming AudioStart back yet?
+        self._ready = asyncio.Event()
 
     async def connect(self):
         print(f"Connecting to ElevenLabs agent {self.agent_id}…")
-        headers = {"xi-api-key": self.api_key} if self.api_key else None
-        url = f"{ELEVEN_WSS}?agent_id={self.agent_id}"
-        self.ws = await websockets.connect(url)
-        # mandatory first frame
-        await self.ws.send(json.dumps({"type": "conversation_initiation_client_data"}))
+        signed_ws = await get_signed_url(self.agent_id, self.api_key)
+        self._ws = await websockets.connect(signed_ws)   # no headers!
+        await self._ws.send(json.dumps({
+            "type": "conversation_initiation_client_data"
+        }))
+        self._ready.set()
         _LOGGER.debug("Opened ElevenLabs session")
 
     async def send_pcm(self, chunk: AudioChunk):
         """Forward raw PCM from Wyoming to Eleven."""
         print(f"Sending audio chunk to ElevenLabs agent {self.agent_id}…")
-        if self.ws is None:
-            raise RuntimeError("WebSocket not connected")
+        await self._ready.wait()
         await self.ws.send(json.dumps({
             "user_audio_chunk": base64.b64encode(chunk.audio).decode()
         }))
+        print(f"Sent {chunk.samples} samples to ElevenLabs agent {self.agent_id}")
 
     async def recv_events(self):
         """Async generator of Wyoming audio events produced by agent TTS."""

@@ -5,20 +5,22 @@ Tested on Windows 10/11 with Python 3.11, wyoming ≥0.8.0, websockets ≥12.
 """
 
 import asyncio, os, json, base64, argparse, logging
-import httpx, time, functools, os
+import httpx, time, os, math
 import websockets
 from wyoming.audio import AudioFormat, AudioStart, AudioChunk, AudioStop
 from wyoming.event import Event
 from wyoming.info import (
     Info, Attribution, TtsProgram, TtsVoice,
-    SndProgram, Describe, TtsVoiceSpeaker,
-    AsrModel, AsrProgram
+    SndProgram, AsrModel, AsrProgram
 )
 from wyoming.server import AsyncServer, AsyncEventHandler
 
 _LOGGER = logging.getLogger("wyoming-elevenlabs")
 
 ELEVEN_WSS = "wss://api.elevenlabs.io/v1/convai/conversation"
+
+CHUNK_PCM_BYTES   = 640            # 20 ms  (16 000 Hz × 0.02 s × 2 bytes)
+CHUNK_PCM_B64_LEN = math.ceil(CHUNK_PCM_BYTES / 3) * 4   #  ≈ 852 chars
 
 async def fetch_signed_url(agent_id: str, api_key: str) -> str:
     url = "https://api.elevenlabs.io/v1/convai/conversation/get-signed-url"
@@ -47,6 +49,7 @@ class ElevenSession:
         self.api_key = api_key
         self.websocket: websockets.WebSocketClientProtocol | None = None
         self.ready = asyncio.Event()
+        self._sent_start = False
 
     async def connect(self):
         print(f"Connecting to ElevenLabs agent {self.agent_id}…")
@@ -62,13 +65,17 @@ class ElevenSession:
         """Forward raw PCM from Wyoming to Eleven."""
         print(f"Sending audio chunk to ElevenLabs agent {self.agent_id}…")
         await self.ready.wait()
-        pcm = chunk.audio                    # raw 16-bit little-endian
-        frame_len = 320                      # 20 ms @16 kHz * 2 bytes
-        for i in range(0, len(pcm), frame_len):
-            piece = pcm[i : i + frame_len]
-            await self.ws.send(json.dumps({
+
+        pcm = chunk.audio
+        for i in range(0, len(pcm), CHUNK_PCM_BYTES):
+            piece = pcm[i:i + CHUNK_PCM_BYTES]
+            if not piece:
+                continue
+
+            message = {
                 "user_audio_chunk": base64.b64encode(piece).decode()
-            }))
+            }
+            await self.websocket.send(json.dumps(message))
             
         print(f"Sent {len(pcm)} bytes of audio to ElevenLabs agent {self.agent_id}")
 

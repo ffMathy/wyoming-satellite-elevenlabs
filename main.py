@@ -86,11 +86,13 @@ class ElevenSession:
         Reconnects transparently if the socket drops.
         """
         await self.ready.wait()
+        self._sent_start = False
+
         while True:
             async for msg in self.websocket:
                 frame = json.loads(msg)
-                print(f"Received frame from ElevenLabs: {frame}")
                 ftype = frame.get("type")
+                print(f"Received {ftype} frame from ElevenLabs")
 
                 # keep-alive
                 if ftype == "ping":
@@ -104,11 +106,14 @@ class ElevenSession:
                 if ftype == "audio":
                     pcm = base64.b64decode(
                         frame["audio_event"]["audio_base_64"])
+                    print(f"Received {len(pcm)} bytes of audio")
                     if not self._sent_start:
                         self._sent_start = True
+                        print("AudioStart")
                         yield AudioStart(rate=16000,
                                             width=2, channels=1).event()
                         
+                    print("AudioChunk")
                     yield AudioChunk(rate=16000, width=2,
                                         channels=1, audio=pcm).event()
                     continue
@@ -145,7 +150,7 @@ class BridgeHandler(AsyncEventHandler):
 
     # Wyoming → ElevenLabs -----------------------------------------------------
     async def handle_event(self, event: Event) -> bool:
-        print(f"Received event: {event}")
+        print(f"Received event: {event.type}")
         etype = event.type
         if etype == "describe":                 # handshake step 1
             attribution = Attribution(name="ElevenLabs", url="https://elevenlabs.io")

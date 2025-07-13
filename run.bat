@@ -1,0 +1,1 @@
+python3.13 main.py --listen tcp://0.0.0.0:10700 --debug

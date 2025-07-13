@@ -7,6 +7,7 @@ Tested on Windows 10/11 with Python 3.11, wyoming ≥0.8.0, websockets ≥12.
 import asyncio, os, json, base64, argparse, logging
 import httpx, time, os, math
 import websockets
+from typing import Optional
 from wyoming.audio import AudioFormat, AudioStart, AudioChunk, AudioStop
 from wyoming.event import Event
 from wyoming.info import (
@@ -24,7 +25,9 @@ CHUNK_PCM_B64_LEN = math.ceil(CHUNK_PCM_BYTES / 3) * 4   #  ≈ 852 chars
 
 async def fetch_signed_url(agent_id: str, api_key: str) -> str:
     url = "https://api.elevenlabs.io/v1/convai/conversation/get-signed-url"
-    headers = {"xi-api-key": api_key}
+    headers = {}
+    if api_key:
+        headers["xi-api-key"] = api_key
     params  = {"agent_id": agent_id}
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(url, headers=headers, params=params)
@@ -44,29 +47,41 @@ async def get_signed_url(agent_id, api_key):
 # -----------------------------------------------------------------------------
 class ElevenSession:
     """Maintains one agent WebSocket per Wyoming client."""
-    def __init__(self, agent_id: str, api_key: str | None):
+    def __init__(self, agent_id: str, api_key: Optional[str]):
         self.agent_id = agent_id
         self.api_key = api_key
-        self.websocket: websockets.WebSocketClientProtocol | None = None
+        self.websocket: Optional[websockets.WebSocketClientProtocol] = None
         self.ready = asyncio.Event()
         self._sent_start = False
 
     async def connect(self):
         print(f"Connecting to ElevenLabs agent {self.agent_id}…")
         signed_ws = await get_signed_url(self.agent_id, self.api_key)
+        print(f"Using signed WebSocket URL: {signed_ws[:50]}...")
         self.websocket = await websockets.connect(signed_ws)   # no headers!
-        await self.websocket.send(json.dumps({
-            "type": "conversation_initiation_client_data"
-        }))
+        
+        init_message = {"type": "conversation_initiation_client_data"}
+        print(f"Sending initialization message: {json.dumps(init_message)}")
+        await self.websocket.send(json.dumps(init_message))
+        
         self.ready.set()
         _LOGGER.debug("Opened ElevenLabs session")
 
     async def send_pcm(self, chunk: AudioChunk):
         """Forward raw PCM from Wyoming to Eleven."""
-        print(f"Sending audio chunk to ElevenLabs agent {self.agent_id}…")
+        print(f"Sending audio chunk to ElevenLabs agent {self.agent_id}… (rate={chunk.rate}, width={chunk.width}, channels={chunk.channels})")
         await self.ready.wait()
 
         pcm = chunk.audio
+        print(f"Audio chunk details: {len(pcm)} bytes, sample rate: {chunk.rate}")
+        
+        # Send conversation trigger on first audio chunk
+        if not self._sent_start:
+            trigger_message = {"type": "user_message", "message": "Hello, can you hear me?"}
+            print(f"Sending conversation trigger: {json.dumps(trigger_message)}")
+            await self.websocket.send(json.dumps(trigger_message))
+            self._sent_start = True
+        
         for i in range(0, len(pcm), CHUNK_PCM_BYTES):
             piece = pcm[i:i + CHUNK_PCM_BYTES]
             if not piece:
@@ -75,6 +90,7 @@ class ElevenSession:
             message = {
                 "user_audio_chunk": base64.b64encode(piece).decode()
             }
+            print(f"Sending message to ElevenLabs...")
             await self.websocket.send(json.dumps(message))
             
         print(f"Sent {len(pcm)} bytes of audio to ElevenLabs agent {self.agent_id}")
@@ -107,32 +123,55 @@ class ElevenSession:
                     pcm = base64.b64decode(
                         frame["audio_event"]["audio_base_64"])
                     print(f"Received {len(pcm)} bytes of audio")
+                    
+                    # Audio format debugging
+                    print(f"Audio format check - Bytes: {len(pcm)}, Sample rate: 16000, Width: 2, Channels: 1")
+                    if len(pcm) % 2 != 0:
+                        print(f"WARNING: Audio data length {len(pcm)} is not even (not aligned to 16-bit samples)")
+                    
                     if not self._sent_start:
                         self._sent_start = True
                         print("AudioStart")
                         yield AudioStart(rate=16000,
-                                            width=2, channels=1).event()
-                        
-                    print("AudioChunk")
-                    yield AudioChunk(rate=16000, width=2,
-                                        channels=1, audio=pcm).event()
+                                            width=2, channels=1)
+                    
+                    # Split large audio chunks into smaller ones for better compatibility
+                    chunk_size = 1024  # 512 samples * 2 bytes = 1024 bytes
+                    for i in range(0, len(pcm), chunk_size):
+                        chunk = pcm[i:i + chunk_size]
+                        if len(chunk) == 0:
+                            continue
+                        print(f"AudioChunk - sending {len(chunk)} bytes (chunk {i//chunk_size + 1} of {(len(pcm) + chunk_size - 1)//chunk_size})")
+                        yield AudioChunk(rate=16000, width=2,
+                                            channels=1, audio=chunk)
+                    
+                    # Send AudioStop after all chunks to complete the audio stream
+                    if self._sent_start:
+                        self._sent_start = False
+                        print("AudioStop - completing audio stream")
+                        yield AudioStop()
                     continue
 
                 # Conversation turn finished
                 if ftype == "agent_response" and self._sent_start:
                     self._sent_start = False
-                    yield AudioStop().event()
+                    print("AudioStop")
+                    yield AudioStop()
                     continue
 
                 # (Optional) user transcript event
                 if ftype == "user_transcript":
                     text = frame["user_transcription_event"] \
                                 ["user_transcript"]
+                    print(f"User transcript: {text}")
                     yield Event("transcript", data={
                         "text": text,
                         "is_final": True,
                         "confidence": 0.9
                     })
+                    
+                # Log any other frame types we might be missing
+                print(f"Unhandled frame type: {ftype}")
 
     async def close(self):
         if self.websocket:
@@ -145,8 +184,8 @@ class BridgeHandler(AsyncEventHandler):
         super().__init__(reader, writer)
         self.agent_id = agent_id
         self.api_key = api_key
-        self._session: ElevenSession | None = None
-        self._eleven_task: asyncio.Task | None = None
+        self._session: Optional[ElevenSession] = None
+        self._eleven_task: Optional[asyncio.Task] = None
 
     # Wyoming → ElevenLabs -----------------------------------------------------
     async def handle_event(self, event: Event) -> bool:
@@ -226,7 +265,10 @@ class BridgeHandler(AsyncEventHandler):
         assert self._session is not None
         try:
             async for wy_event in self._session.receive_events():
-                await self.write_event(wy_event.event() if hasattr(wy_event, "event") else wy_event)
+                if hasattr(wy_event, 'event'):
+                    await self.write_event(wy_event.event())
+                else:
+                    await self.write_event(wy_event)
         except Exception as err:
             _LOGGER.exception("Error reading from ElevenLabs: %s", err)
 
@@ -247,6 +289,9 @@ async def main():
                         help="API key (omit for public agents)")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
+
+    if not args.agent_id:
+        parser.error("--agent-id is required. Set ELEVEN_AGENT_ID environment variable or use --agent-id")
 
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
